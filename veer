@@ -5,6 +5,7 @@ Veer - A simple TCP redirector
 import argparse
 import select
 import socket
+import sys
 import time
 
 def print_debug(debug, data):
@@ -13,68 +14,126 @@ def print_debug(debug, data):
     '''
     if not debug:
         return
-    print(data)
+    sys.stderr.write(f'{data}\n')
+    sys.stderr.flush()
 
-def available(conn):
-    '''
-    Returns whether there are bytes to read from a given conn or not
-    '''
-    try:
-        readable, _writeable, _errored = select.select([conn], [], [], 0)
-        return conn in readable
-
-    except Exception:
-        return False
-
-def proxy_sockets(read_socket, write_socket):
+def proxy_sockets(debug, read_sock, write_sock):
     '''
     One way proxy reading bytes from read_socket and sending them to write_socket
     '''
+    bytes_read = 0
     try:
-        if not available(read_socket):
+        if not read_sock.available():
             return True
+        bytes_read = read_sock.recv(4096)
+        print_debug(debug, f'Read {len(bytes_read)} bytes {read_sock} > {write_sock}')
 
-        bytes_read = read_socket.recv(4096)
+    except Exception:
+        pass
 
-        if not bytes_read:
-            return False
+    if not bytes_read:
+        print_debug(debug, f'Connection closed by source {read_sock} > {write_sock}')
+        return False
 
-        nbytes_written = write_socket.send(bytes_read)
-
+    try:
+        nbytes_written = write_sock.send(bytes_read)
+        print_debug(debug, f'Sent {nbytes_written} bytes {read_sock} > {write_sock}')
         return nbytes_written == len(bytes_read)
 
     except Exception:
+        print_debug(debug, f'Connection closed by destination {read_sock} > {write_sock}')
         return False
 
-class Client:
+class Socket:
+    '''
+    Simple Wrapper around an addr/sock
+    '''
+    def __init__(self, addr, sock=None):
+        self.addr = addr
+        if sock:
+            self.sock = sock
+        else:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    def __str__(self):
+        return f'{self.addr[0]}:{self.addr[1]}'
+
+    def accept(self):
+        '''
+        Accept connection from passed address
+        '''
+        return self.sock.accept()
+
+    def available(self):
+        '''
+        Returns whether there are bytes to read from a given conn or not
+        '''
+        try:
+            readable, _writeable, _errored = select.select([self.sock], [], [], 0)
+            return self.sock in readable
+
+        except Exception:
+            return False
+
+    def close(self):
+        '''
+        Closes socket (no throw)
+        '''
+        try:
+            return self.sock.close()
+        except Exception:
+            return None
+
+    def connect(self):
+        '''
+        Connect to passed address
+        '''
+        return self.sock.connect(self.addr)
+
+    def listen(self):
+        '''
+        Listen on passed address
+        '''
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET,socket.SO_KEEPALIVE,1)
+        self.sock.bind(self.addr)
+        return self.sock.listen()
+
+    def recv(self, nbytes):
+        '''
+        Receive data from passed address
+        '''
+        return self.sock.recv(nbytes)
+
+    def send(self, data):
+        '''
+        Send data to passed address
+        '''
+        return self.sock.send(data)
+
+class RedirectClient:
     '''
     Simple wrapper around a TCP client
     '''
-    def __init__(self, debug, src_socket, src_addr, dst_addr):
+    def __init__(self, debug, src, dst_addr):
         '''
         Keep variables that matter and create connection to dst socket
         '''
         self.debug = debug
-        self.src_socket = src_socket
-        self.src_addr = src_addr
-        self.dst_addr = dst_addr
+        self.src = src
+        print_debug(self.debug, f'Connection received on {self.src}')
 
-        print_debug(self.debug, f'Connection received on {self.src_addr[0]} {self.src_addr[1]}')
-
-        self.dst_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.dst_socket.connect(dst_addr)
-        print_debug(self.debug, f'Opened connection to {dst_addr[0]} {dst_addr[1]}')
+        self.dst = Socket(dst_addr)
+        self.dst.connect()
+        print_debug(self.debug, f'Opened redirection connection to {self.dst}')
 
     def update(self):
         '''
         Proxy both ways and return false/true based on error/success
         '''
-        if not proxy_sockets(self.src_socket, self.dst_socket):
-            print_debug(self.debug, 'Error proxying src -> dst')
+        if not proxy_sockets(self.debug, self.src, self.dst):
             return self.close()
-
-        if not proxy_sockets(self.dst_socket, self.src_socket):
-            print_debug(self.debug, 'Error proxying src -> dst')
+        if not proxy_sockets(self.debug, self.dst, self.src):
             return self.close()
 
         return True
@@ -83,14 +142,8 @@ class Client:
         '''
         Close both sockets without error
         '''
-        try:
-            self.src_socket.close()
-            self.dst_socket.close()
-            print_debug(self.debug, f'Connection {self.src_addr[0]} {self.src_addr[1]} closed')
-
-        except Exception:
-            pass
-
+        self.src.close()
+        self.dst.close()
         return False
 
 def main():
@@ -110,23 +163,21 @@ def main():
     redirect_addr = (args.redirect_host, args.redirect_port)
 
     # Setup listen socket
-    listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listen_socket.setsockopt(socket.SOL_SOCKET,socket.SO_KEEPALIVE,1)
-    listen_socket.bind(listen_addr)
-    listen_socket.listen()
+    listen_sock = Socket(listen_addr)
+    listen_sock.listen()
 
     # Debug
-    print_debug(debug, f'Listening on {listen_addr[0]} {listen_addr[1]}')
-    print_debug(debug, f'Redirecting to {redirect_addr[0]} {redirect_addr[1]}')
+    print_debug(debug, f'Listening on {listen_sock}')
+    print_debug(debug, f'Redirecting to {redirect_addr[0]}:{redirect_addr[1]}')
 
     clients = []
 
     while True:
         # Add new clients
-        if available(listen_socket):
-            src_socket, src_addr = listen_socket.accept()
-            clients.append(Client(debug, src_socket, src_addr, redirect_addr))
+        if listen_sock.available():
+            src_sock, src_addr = listen_sock.accept()
+            src = Socket(src_addr, src_sock)
+            clients.append(RedirectClient(debug, src, redirect_addr))
 
         # Serve clients
         remove_inds = []
