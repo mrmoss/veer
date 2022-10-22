@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+'''
+Veer - A simple TCP redirector
+'''
+import argparse
+import select
+import socket
+import time
+
+def print_debug(debug, data):
+    '''
+    Only print if debug is enabled
+    '''
+    if not debug:
+        return
+    print(data)
+
+def available(conn):
+    '''
+    Returns whether there are bytes to read from a given conn or not
+    '''
+    try:
+        readable, _writeable, _errored = select.select([conn], [], [], 0)
+        return conn in readable
+
+    except Exception:
+        return False
+
+def proxy_sockets(read_socket, write_socket):
+    '''
+    One way proxy reading bytes from read_socket and sending them to write_socket
+    '''
+    try:
+        if not available(read_socket):
+            return True
+
+        bytes_read = read_socket.recv(4096)
+
+        if not bytes_read:
+            return False
+
+        nbytes_written = write_socket.send(bytes_read)
+
+        return nbytes_written == len(bytes_read)
+
+    except Exception:
+        return False
+
+class Client:
+    '''
+    Simple wrapper around a TCP client
+    '''
+    def __init__(self, debug, src_socket, src_addr, dst_addr):
+        '''
+        Keep variables that matter and create connection to dst socket
+        '''
+        self.debug = debug
+        self.src_socket = src_socket
+        self.src_addr = src_addr
+        self.dst_addr = dst_addr
+
+        print_debug(self.debug, f'Connection received on {self.src_addr[0]} {self.src_addr[1]}')
+
+        self.dst_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.dst_socket.connect(dst_addr)
+        print_debug(self.debug, f'Opened connection to {dst_addr[0]} {dst_addr[1]}')
+
+    def update(self):
+        '''
+        Proxy both ways and return false/true based on error/success
+        '''
+        if not proxy_sockets(self.src_socket, self.dst_socket):
+            print_debug(self.debug, 'Error proxying src -> dst')
+            return self.close()
+
+        if not proxy_sockets(self.dst_socket, self.src_socket):
+            print_debug(self.debug, 'Error proxying src -> dst')
+            return self.close()
+
+        return True
+
+    def close(self):
+        '''
+        Close both sockets without error
+        '''
+        try:
+            self.src_socket.close()
+            self.dst_socket.close()
+            print_debug(self.debug, f'Connection {self.src_addr[0]} {self.src_addr[1]} closed')
+
+        except Exception:
+            pass
+
+        return False
+
+def main():
+    '''
+    Main function
+    '''
+    # Cli arg parse
+    parser = argparse.ArgumentParser(description='Veer - A simple TCP redirector')
+    parser.add_argument('listen_host', help='Listen host', type=str)
+    parser.add_argument('listen_port', help='Listen port', type=int)
+    parser.add_argument('redirect_host', help='Redirect host', type=str)
+    parser.add_argument('redirect_port', help='Redirect port', type=int)
+    parser.add_argument('--verbose', '-v', help='Debug logging', action='store_true')
+    args = parser.parse_args()
+    debug = args.verbose
+    listen_addr = (args.listen_host, args.listen_port)
+    redirect_addr = (args.redirect_host, args.redirect_port)
+
+    # Setup listen socket
+    listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen_socket.setsockopt(socket.SOL_SOCKET,socket.SO_KEEPALIVE,1)
+    listen_socket.bind(listen_addr)
+    listen_socket.listen()
+
+    # Debug
+    print_debug(debug, f'Listening on {listen_addr[0]} {listen_addr[1]}')
+    print_debug(debug, f'Redirecting to {redirect_addr[0]} {redirect_addr[1]}')
+
+    clients = []
+
+    while True:
+        # Add new clients
+        if available(listen_socket):
+            src_socket, src_addr = listen_socket.accept()
+            clients.append(Client(debug, src_socket, src_addr, redirect_addr))
+
+        # Serve clients
+        remove_inds = []
+        for ind, client in enumerate(clients):
+            if not client.update():
+                remove_inds.append(ind)
+
+        # Remove disconnected clients
+        if remove_inds:
+            clients = [client for ind, client in enumerate(clients) if ind not in remove_inds]
+
+        # Give CPU a break via sleep
+        time.sleep(0.0001)
+
+if __name__ == '__main__':
+    main()
